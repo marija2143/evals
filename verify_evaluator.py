@@ -56,8 +56,8 @@ def is_cerebras_model(model: str) -> bool:
 DEFAULT_MODEL = "gpt-5-mini-2025-08-07"
 DATA_FILE = "data/questions_version_2.csv"
 
-# Function calling tool for reliable structured output
-EVAL_TOOL = {
+# Function calling tool for reliable structured output (OpenAI format)
+EVAL_TOOL_OPENAI = {
     "type": "function",
     "name": "submit_evaluation",
     "description": "Submit the evaluation result for a question/response pair",
@@ -80,6 +80,33 @@ EVAL_TOOL = {
     }
 }
 
+# Function calling tool for Cerebras (strict goes inside function object)
+# See: https://inference-docs.cerebras.ai/capabilities/tool-use
+EVAL_TOOL_CEREBRAS = {
+    "type": "function",
+    "function": {
+        "name": "submit_evaluation",
+        "strict": True,
+        "description": "Submit the evaluation result for a question/response pair",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "verdict": {
+                    "type": "string",
+                    "enum": ["pass", "fail"],
+                    "description": "pass if the response correctly answers the question, fail otherwise"
+                },
+                "reasoning": {
+                    "type": "string",
+                    "description": "Brief explanation for the verdict (1-2 sentences)"
+                }
+            },
+            "required": ["verdict", "reasoning"],
+            "additionalProperties": False
+        }
+    }
+}
+
 
 def load_dataset(filepath: str) -> list[dict]:
     """Load labeled dataset."""
@@ -90,6 +117,9 @@ def load_dataset(filepath: str) -> list[dict]:
 
 def evaluate_response_openai(question: str, response: str, model: str, retries: int = 3) -> tuple[str, str]:
     """Evaluate using OpenAI Responses API with function calling."""
+    import time
+    import random
+
     prompt = f"""You are evaluating whether an AI response correctly and helpfully answers a question.
 
 Question: {question}
@@ -110,7 +140,7 @@ Use the submit_evaluation tool to provide your verdict:
             result = openai_client.responses.create(
                 model=model,
                 input=[{"role": "user", "content": prompt}],
-                tools=[EVAL_TOOL],
+                tools=[EVAL_TOOL_OPENAI],
                 tool_choice={"type": "function", "name": "submit_evaluation"},
             )
 
@@ -123,16 +153,25 @@ Use the submit_evaluation tool to provide your verdict:
 
         except Exception as e:
             if attempt < retries - 1:
-                import time
-                time.sleep(2 ** attempt)
+                # Exponential backoff with jitter
+                delay = (2 ** attempt) + random.uniform(0, 1)
+                time.sleep(delay)
             else:
                 return "fail", f"Error: {e}"
 
     return "fail", "Max retries exceeded"
 
 
-def evaluate_response_cerebras(question: str, response: str, model: str, retries: int = 3) -> tuple[str, str]:
-    """Evaluate using Cerebras Chat Completions API with text parsing."""
+def evaluate_response_cerebras(question: str, response: str, model: str, retries: int = 5) -> tuple[str, str]:
+    """
+    Evaluate using Cerebras Chat Completions API with function calling.
+
+    Uses OpenAI-compatible tool calling API as per:
+    https://inference-docs.cerebras.ai/capabilities/tool-use
+    """
+    import time
+    import random
+
     prompt = f"""You are evaluating whether an AI response correctly and helpfully answers a question.
 
 Question: {question}
@@ -144,49 +183,60 @@ Evaluate the response on these criteria:
 2. Does it actually answer the question asked?
 3. Is it complete and not misleading?
 
-You MUST respond with EXACTLY one of these two words on the first line, followed by a brief explanation:
-- PASS (if the response is correct and helpful)
-- FAIL (if the response is wrong, incomplete, or misleading)
-
-Example format:
-PASS
-The response correctly answers the question with accurate information.
-
-Your evaluation:"""
+Use the submit_evaluation tool to provide your verdict:
+- "pass" if the response is correct and helpful
+- "fail" if the response is wrong, incomplete, or misleading"""
 
     for attempt in range(retries):
         try:
             result = cerebras_client.chat.completions.create(
                 model=model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=150,
+                messages=[
+                    {"role": "system", "content": "You are an evaluation assistant. Always use the submit_evaluation tool to provide your verdict."},
+                    {"role": "user", "content": prompt}
+                ],
+                tools=[EVAL_TOOL_CEREBRAS],
+                tool_choice={"type": "function", "function": {"name": "submit_evaluation"}},
                 temperature=0,
             )
 
-            text = result.choices[0].message.content.strip()
-            first_line = text.split('\n')[0].strip().upper()
+            message = result.choices[0].message
 
-            if "PASS" in first_line:
-                verdict = "pass"
-            elif "FAIL" in first_line:
-                verdict = "fail"
-            else:
-                # Try to find pass/fail anywhere in response
-                text_upper = text.upper()
-                if text_upper.startswith("PASS") or "VERDICT: PASS" in text_upper:
-                    verdict = "pass"
+            # Check for tool calls (function calling response)
+            if message.tool_calls:
+                tool_call = message.tool_calls[0]
+                if tool_call.function.name == "submit_evaluation":
+                    args = json.loads(tool_call.function.arguments)
+                    verdict = args.get("verdict", "fail")
+                    reasoning = args.get("reasoning", "")
+                    return verdict, reasoning[:200]
+
+            # Fallback: parse text response if no tool call (shouldn't happen with tool_choice)
+            if message.content:
+                text = message.content.strip().upper()
+                if "PASS" in text[:20]:
+                    return "pass", "Fallback text parse: " + message.content[:100]
                 else:
-                    verdict = "fail"
+                    return "fail", "Fallback text parse: " + message.content[:100]
 
-            reasoning = text[len(first_line):].strip() if len(text) > len(first_line) else text
-            return verdict, reasoning[:200]
+            return "fail", "No tool call or content in response"
 
         except Exception as e:
+            error_str = str(e)
+
+            # Handle rate limiting with longer backoff
+            if "429" in error_str or "rate" in error_str.lower():
+                if attempt < retries - 1:
+                    delay = (3 ** attempt) + random.uniform(1, 3)  # Longer backoff for rate limits
+                    time.sleep(delay)
+                    continue
+
+            # Handle other errors with standard backoff
             if attempt < retries - 1:
-                import time
-                time.sleep(2 ** attempt)
+                delay = (2 ** attempt) + random.uniform(0, 1)
+                time.sleep(delay)
             else:
-                return "fail", f"Error: {e}"
+                return "fail", f"Error after {retries} attempts: {error_str[:100]}"
 
     return "fail", "Max retries exceeded"
 
