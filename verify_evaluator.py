@@ -1,345 +1,72 @@
+#!/usr/bin/env python3
 """
 Verify LLM Evaluator Against Ground Truth Labels
+=================================================
 
 This script implements Eugene Yan's eval verification methodology:
 https://eugeneyan.com/writing/product-evals/
 
 Setup:
-- Ground truth: GPT-5.1 labels in data/questions_version_2.csv (simulating human labels)
+- Ground truth: GPT-5.1 labels in data/questions_version_2.csv
 - Evaluator: Configurable model (default: gpt-5-mini)
-- Goal: Measure how well smaller models can replicate GPT-5.1's labeling decisions
+- Goal: Measure how well smaller models replicate GPT-5.1's decisions
 
 Key Metrics (from Eugene Yan):
-- Cohen's Kappa: 0.4-0.6 = substantial agreement, >0.7 = excellent
+- Cohen's Kappa: 0.4-0.6 = substantial agreement (target)
 - Prioritize RECALL on failures (catching defects is critical)
 - Human inter-rater reliability is often only 0.2-0.3
 
 Usage:
-    uv run verify_evaluator.py [--sample N] [--train-test] [--model MODEL]
+    uv run verify_evaluator.py [--sample N] [--model MODEL] [--category CAT]
 
 Examples:
-    uv run verify_evaluator.py --sample 50 --model gpt-5-mini-2025-08-07
-    uv run verify_evaluator.py --sample 50 --model gpt-5-nano-2025-08-07
-    uv run verify_evaluator.py --sample 50 --model llama3.1-8b  # Cerebras
+    uv run verify_evaluator.py --sample 50
+    uv run verify_evaluator.py --model gpt-5-nano-2025-08-07
+    uv run verify_evaluator.py --category precise_calculations
+
+See:
+    - docs/tutorial/ for learning progression
+    - docs/glossary.md for terminology
+    - examples/ for simple examples
 """
 
-import os
-import csv
-import json
 import random
 import argparse
-from datetime import datetime
-from collections import defaultdict
-from dotenv import load_dotenv
-from openai import OpenAI
 
-load_dotenv()
-
-# OpenAI client for GPT models
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-# Cerebras client (OpenAI-compatible)
-cerebras_client = OpenAI(
-    api_key=os.getenv("CEREBRAS_API_KEY"),
-    base_url="https://api.cerebras.ai/v1"
+from evaluators.runner import (
+    load_dataset,
+    run_evaluation,
+    print_results,
+    save_run,
 )
 
-# Cerebras model IDs
-CEREBRAS_MODELS = {"llama3.1-8b", "llama-3.3-70b", "gpt-oss-120b", "qwen-3-32b"}
-
-
-def is_cerebras_model(model: str) -> bool:
-    """Check if model is hosted on Cerebras."""
-    return model in CEREBRAS_MODELS
-
-# Default evaluator model (can be overridden with --model flag)
+# Configuration
 DEFAULT_MODEL = "gpt-5-mini-2025-08-07"
 DATA_FILE = "data/questions_version_2.csv"
 
-# Function calling tool for reliable structured output (OpenAI format)
-EVAL_TOOL_OPENAI = {
-    "type": "function",
-    "name": "submit_evaluation",
-    "description": "Submit the evaluation result for a question/response pair",
-    "strict": True,
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "verdict": {
-                "type": "string",
-                "enum": ["pass", "fail"],
-                "description": "pass if the response correctly answers the question, fail otherwise"
-            },
-            "reasoning": {
-                "type": "string",
-                "description": "Brief explanation for the verdict (1-2 sentences)"
-            }
-        },
-        "required": ["verdict", "reasoning"],
-        "additionalProperties": False
-    }
-}
-
-# Function calling tool for Cerebras (strict goes inside function object)
-# See: https://inference-docs.cerebras.ai/capabilities/tool-use
-EVAL_TOOL_CEREBRAS = {
-    "type": "function",
-    "function": {
-        "name": "submit_evaluation",
-        "strict": True,
-        "description": "Submit the evaluation result for a question/response pair",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "verdict": {
-                    "type": "string",
-                    "enum": ["pass", "fail"],
-                    "description": "pass if the response correctly answers the question, fail otherwise"
-                },
-                "reasoning": {
-                    "type": "string",
-                    "description": "Brief explanation for the verdict (1-2 sentences)"
-                }
-            },
-            "required": ["verdict", "reasoning"],
-            "additionalProperties": False
-        }
-    }
-}
-
-
-def load_dataset(filepath: str) -> list[dict]:
-    """Load labeled dataset."""
-    with open(filepath, "r") as f:
-        reader = csv.DictReader(f)
-        return [row for row in reader if row.get("label")]  # Only rows with labels
-
-
-def evaluate_response_openai(question: str, response: str, model: str, retries: int = 3) -> tuple[str, str]:
-    """Evaluate using OpenAI Responses API with function calling."""
-    import time
-    import random
-
-    prompt = f"""You are evaluating whether an AI response correctly and helpfully answers a question.
-
-Question: {question}
-
-Response: {response}
-
-Evaluate the response on these criteria:
-1. Is the response factually correct?
-2. Does it actually answer the question asked?
-3. Is it complete and not misleading?
-
-Use the submit_evaluation tool to provide your verdict:
-- "pass" if the response is correct and helpful
-- "fail" if the response is wrong, incomplete, or misleading"""
-
-    for attempt in range(retries):
-        try:
-            result = openai_client.responses.create(
-                model=model,
-                input=[{"role": "user", "content": prompt}],
-                tools=[EVAL_TOOL_OPENAI],
-                tool_choice={"type": "function", "name": "submit_evaluation"},
-            )
-
-            for item in result.output:
-                if item.type == "function_call" and item.name == "submit_evaluation":
-                    args = json.loads(item.arguments)
-                    return args.get("verdict", "fail"), args.get("reasoning", "")
-
-            return "fail", "No function call found"
-
-        except Exception as e:
-            if attempt < retries - 1:
-                # Exponential backoff with jitter
-                delay = (2 ** attempt) + random.uniform(0, 1)
-                time.sleep(delay)
-            else:
-                return "fail", f"Error: {e}"
-
-    return "fail", "Max retries exceeded"
-
-
-def evaluate_response_cerebras(question: str, response: str, model: str, retries: int = 5) -> tuple[str, str]:
-    """
-    Evaluate using Cerebras Chat Completions API with function calling.
-
-    Uses OpenAI-compatible tool calling API as per:
-    https://inference-docs.cerebras.ai/capabilities/tool-use
-    """
-    import time
-    import random
-
-    prompt = f"""You are evaluating whether an AI response correctly and helpfully answers a question.
-
-Question: {question}
-
-Response: {response}
-
-Evaluate the response on these criteria:
-1. Is the response factually correct?
-2. Does it actually answer the question asked?
-3. Is it complete and not misleading?
-
-Use the submit_evaluation tool to provide your verdict:
-- "pass" if the response is correct and helpful
-- "fail" if the response is wrong, incomplete, or misleading"""
-
-    for attempt in range(retries):
-        try:
-            result = cerebras_client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": "You are an evaluation assistant. Always use the submit_evaluation tool to provide your verdict."},
-                    {"role": "user", "content": prompt}
-                ],
-                tools=[EVAL_TOOL_CEREBRAS],
-                tool_choice={"type": "function", "function": {"name": "submit_evaluation"}},
-                temperature=0,
-            )
-
-            message = result.choices[0].message
-
-            # Check for tool calls (function calling response)
-            if message.tool_calls:
-                tool_call = message.tool_calls[0]
-                if tool_call.function.name == "submit_evaluation":
-                    args = json.loads(tool_call.function.arguments)
-                    verdict = args.get("verdict", "fail")
-                    reasoning = args.get("reasoning", "")
-                    return verdict, reasoning[:200]
-
-            # Fallback: parse text response if no tool call (shouldn't happen with tool_choice)
-            if message.content:
-                text = message.content.strip().upper()
-                if "PASS" in text[:20]:
-                    return "pass", "Fallback text parse: " + message.content[:100]
-                else:
-                    return "fail", "Fallback text parse: " + message.content[:100]
-
-            return "fail", "No tool call or content in response"
-
-        except Exception as e:
-            error_str = str(e)
-
-            # Handle rate limiting with longer backoff
-            if "429" in error_str or "rate" in error_str.lower():
-                if attempt < retries - 1:
-                    delay = (3 ** attempt) + random.uniform(1, 3)  # Longer backoff for rate limits
-                    time.sleep(delay)
-                    continue
-
-            # Handle other errors with standard backoff
-            if attempt < retries - 1:
-                delay = (2 ** attempt) + random.uniform(0, 1)
-                time.sleep(delay)
-            else:
-                return "fail", f"Error after {retries} attempts: {error_str[:100]}"
-
-    return "fail", "Max retries exceeded"
-
-
-def evaluate_response(question: str, response: str, model: str, retries: int = 3) -> tuple[str, str]:
-    """
-    Evaluate a question/response pair using the specified model.
-    Returns (verdict, reasoning).
-    """
-    if is_cerebras_model(model):
-        return evaluate_response_cerebras(question, response, model, retries)
-    else:
-        return evaluate_response_openai(question, response, model, retries)
-
-
-def calculate_metrics(results: list[dict]) -> dict:
-    """
-    Calculate evaluation metrics.
-
-    Key insight from Eugene Yan:
-    - Prioritize RECALL on failures (we want to catch defects)
-    - Cohen's Kappa accounts for chance agreement
-    """
-    # Confusion matrix
-    tp = sum(1 for r in results if r["label"] == "pass" and r["pred"] == "pass")
-    fp = sum(1 for r in results if r["label"] == "fail" and r["pred"] == "pass")
-    fn = sum(1 for r in results if r["label"] == "pass" and r["pred"] == "fail")
-    tn = sum(1 for r in results if r["label"] == "fail" and r["pred"] == "fail")
-
-    total = len(results)
-
-    # Basic metrics
-    accuracy = (tp + tn) / total if total > 0 else 0
-
-    # Precision/Recall for PASS predictions
-    precision_pass = tp / (tp + fp) if (tp + fp) > 0 else 0
-    recall_pass = tp / (tp + fn) if (tp + fn) > 0 else 0
-
-    # Precision/Recall for FAIL predictions (critical per Eugene Yan)
-    precision_fail = tn / (tn + fn) if (tn + fn) > 0 else 0
-    recall_fail = tn / (tn + fp) if (tn + fp) > 0 else 0  # This is what we care about!
-
-    # F1 scores
-    f1_pass = 2 * precision_pass * recall_pass / (precision_pass + recall_pass) if (precision_pass + recall_pass) > 0 else 0
-    f1_fail = 2 * precision_fail * recall_fail / (precision_fail + recall_fail) if (precision_fail + recall_fail) > 0 else 0
-
-    # Cohen's Kappa
-    # p_observed = accuracy
-    # p_expected = probability of agreement by chance
-    p_observed = accuracy
-    p_yes = ((tp + fp) / total) * ((tp + fn) / total) if total > 0 else 0
-    p_no = ((tn + fn) / total) * ((tn + fp) / total) if total > 0 else 0
-    p_expected = p_yes + p_no
-    kappa = (p_observed - p_expected) / (1 - p_expected) if p_expected < 1 else 0
-
-    # Confidence interval for accuracy (95%)
-    import math
-    se = math.sqrt(accuracy * (1 - accuracy) / total) if total > 0 else 0
-    ci_lower = max(0, accuracy - 1.96 * se)
-    ci_upper = min(1, accuracy + 1.96 * se)
-
-    return {
-        "total": total,
-        "tp": tp, "fp": fp, "fn": fn, "tn": tn,
-        "accuracy": accuracy,
-        "accuracy_ci": (ci_lower, ci_upper),
-        "precision_pass": precision_pass,
-        "recall_pass": recall_pass,
-        "f1_pass": f1_pass,
-        "precision_fail": precision_fail,
-        "recall_fail": recall_fail,  # Critical metric!
-        "f1_fail": f1_fail,
-        "kappa": kappa,
-    }
-
-
-def interpret_kappa(kappa: float) -> str:
-    """Interpret Cohen's Kappa score."""
-    if kappa < 0:
-        return "Poor (worse than chance)"
-    elif kappa < 0.2:
-        return "Slight agreement"
-    elif kappa < 0.4:
-        return "Fair agreement"
-    elif kappa < 0.6:
-        return "Moderate/Substantial agreement"  # Eugene's target
-    elif kappa < 0.8:
-        return "Substantial agreement"
-    else:
-        return "Almost perfect agreement"
-
 
 def main():
-    parser = argparse.ArgumentParser(description="Verify LLM evaluator against ground truth")
+    parser = argparse.ArgumentParser(
+        description="Verify LLM evaluator against ground truth labels"
+    )
     parser.add_argument("--sample", type=int, help="Evaluate only N random samples")
     parser.add_argument("--train-test", action="store_true", help="Use 75/25 train/test split")
     parser.add_argument("--category", type=str, help="Filter by category")
-    parser.add_argument("--model", type=str, default=DEFAULT_MODEL,
-                        help=f"Model to use as evaluator (default: {DEFAULT_MODEL})")
-    parser.add_argument("--output", type=str, default="results/runs.jsonl",
-                        help="Output file for run logs (default: results/runs.jsonl)")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=DEFAULT_MODEL,
+        help=f"Model to use as evaluator (default: {DEFAULT_MODEL})",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="results/runs.jsonl",
+        help="Output file for run logs (default: results/runs.jsonl)",
+    )
     args = parser.parse_args()
 
+    # Header
     print("=" * 70)
     print("LLM Evaluator Verification")
     print("=" * 70)
@@ -357,10 +84,13 @@ def main():
         data = [d for d in data if d.get("category") == args.category]
         print(f"Filtered to {len(data)} samples in category '{args.category}'")
 
-    # Count label distribution
+    # Show label distribution
     pass_count = sum(1 for d in data if d["label"] == "pass")
     fail_count = sum(1 for d in data if d["label"] == "fail")
-    print(f"Label distribution: {pass_count} pass, {fail_count} fail ({fail_count/len(data)*100:.1f}% failure rate)")
+    print(
+        f"Label distribution: {pass_count} pass, {fail_count} fail "
+        f"({fail_count/len(data)*100:.1f}% failure rate)"
+    )
 
     # Sample if requested
     if args.sample:
@@ -375,155 +105,29 @@ def main():
         split = int(len(data) * 0.75)
         train_data, test_data = data[:split], data[split:]
         print(f"Split: {len(train_data)} train (for prompt tuning), {len(test_data)} test")
-        data = test_data  # Only evaluate on test set
+        data = test_data
 
     print(f"\nEvaluating {len(data)} samples...")
     print("-" * 70)
 
+    # Progress callback
+    def progress(current, total, accuracy):
+        print(f"  Progress: {current}/{total} | Accuracy so far: {accuracy*100:.1f}%", flush=True)
+
     # Run evaluation
-    results = []
-    disagreements = []
-
-    for i, row in enumerate(data, 1):
-        pred, reasoning = evaluate_response(row["question"], row["response"], args.model)
-
-        match = pred == row["label"]
-        results.append({
-            "id": row["id"],
-            "category": row.get("category", ""),
-            "label": row["label"],
-            "pred": pred,
-            "match": match,
-            "reasoning": reasoning,
-        })
-
-        symbol = "✓" if match else "✗"
-        if not match:
-            disagreements.append({
-                "id": row["id"],
-                "question": row["question"][:60] + "..." if len(row["question"]) > 60 else row["question"],
-                "label": row["label"],
-                "pred": pred,
-                "reasoning": reasoning,
-            })
-
-        if i % 10 == 0 or i == len(data):
-            correct = sum(1 for r in results if r["match"])
-            print(f"  Progress: {i}/{len(data)} | Accuracy so far: {correct/i*100:.1f}%", flush=True)
-
-    # Calculate metrics
-    metrics = calculate_metrics(results)
+    results = run_evaluation(data, args.model, progress_callback=progress)
 
     # Print results
-    print("\n" + "=" * 70)
-    print("RESULTS")
-    print("=" * 70)
+    print_results(results, args.model, DATA_FILE)
 
-    print("\n### Confusion Matrix ###")
-    print(f"                  Predicted")
-    print(f"                  Pass    Fail")
-    print(f"  Actual Pass     {metrics['tp']:4d}    {metrics['fn']:4d}")
-    print(f"  Actual Fail     {metrics['fp']:4d}    {metrics['tn']:4d}")
-
-    print("\n### Overall Metrics ###")
-    print(f"  Accuracy:     {metrics['accuracy']*100:.1f}% (95% CI: {metrics['accuracy_ci'][0]*100:.1f}%-{metrics['accuracy_ci'][1]*100:.1f}%)")
-    print(f"  Cohen's Kappa: {metrics['kappa']:.3f} - {interpret_kappa(metrics['kappa'])}")
-
-    print("\n### Pass Detection ###")
-    print(f"  Precision: {metrics['precision_pass']*100:.1f}%")
-    print(f"  Recall:    {metrics['recall_pass']*100:.1f}%")
-    print(f"  F1 Score:  {metrics['f1_pass']*100:.1f}%")
-
-    print("\n### Fail Detection (Critical per Eugene Yan) ###")
-    print(f"  Precision: {metrics['precision_fail']*100:.1f}%")
-    print(f"  Recall:    {metrics['recall_fail']*100:.1f}%  <-- Key metric: catching failures")
-    print(f"  F1 Score:  {metrics['f1_fail']*100:.1f}%")
-
-    # Per-category breakdown
-    categories = defaultdict(list)
-    for r in results:
-        if r["category"]:
-            categories[r["category"]].append(r)
-
-    if categories:
-        print("\n### Per-Category Accuracy ###")
-        for cat, cat_results in sorted(categories.items()):
-            cat_metrics = calculate_metrics(cat_results)
-            fail_rate = sum(1 for r in cat_results if r["label"] == "fail") / len(cat_results) * 100
-            print(f"  {cat:25s}: {cat_metrics['accuracy']*100:5.1f}% acc, {cat_metrics['kappa']:.2f} kappa, {fail_rate:.0f}% fail rate ({len(cat_results)} samples)")
-
-    # Show disagreements
-    if disagreements:
-        print(f"\n### Sample Disagreements (showing up to 10) ###")
-        for d in disagreements[:10]:
-            print(f"\n  ID {d['id']}: Ground truth={d['label']}, Predicted={d['pred']}")
-            print(f"  Q: {d['question']}")
-            print(f"  Reasoning: {d['reasoning'][:100]}..." if len(d['reasoning']) > 100 else f"  Reasoning: {d['reasoning']}")
-
-    # Eugene Yan's recommendations
-    print("\n" + "=" * 70)
-    print("INTERPRETATION (Eugene Yan's Guidelines)")
-    print("=" * 70)
-
-    if metrics['kappa'] >= 0.6:
-        print("  ✓ Cohen's Kappa >= 0.6: Substantial agreement - evaluator is reliable")
-    elif metrics['kappa'] >= 0.4:
-        print("  ~ Cohen's Kappa 0.4-0.6: Moderate agreement - acceptable for most use cases")
-    else:
-        print("  ✗ Cohen's Kappa < 0.4: Fair/slight agreement - consider improving prompts")
-
-    if metrics['recall_fail'] >= 0.8:
-        print("  ✓ Fail Recall >= 80%: Good at catching failures (critical for trust)")
-    elif metrics['recall_fail'] >= 0.6:
-        print("  ~ Fail Recall 60-80%: Moderate failure detection - some defects may slip through")
-    else:
-        print("  ✗ Fail Recall < 60%: Poor failure detection - many defects will be missed")
-
-    print(f"\n  Note: Human inter-rater reliability is often only kappa 0.2-0.3")
-    print(f"  Your evaluator: kappa {metrics['kappa']:.3f}")
-
-    # Save run to JSONL file
-    run_record = {
-        "timestamp": datetime.now().isoformat(),
-        "model": args.model,
-        "dataset": DATA_FILE,
-        "sample_size": len(data),
-        "category_filter": args.category,
-        "metrics": {
-            "accuracy": round(metrics['accuracy'], 4),
-            "accuracy_ci": [round(metrics['accuracy_ci'][0], 4), round(metrics['accuracy_ci'][1], 4)],
-            "kappa": round(metrics['kappa'], 4),
-            "precision_pass": round(metrics['precision_pass'], 4),
-            "recall_pass": round(metrics['recall_pass'], 4),
-            "f1_pass": round(metrics['f1_pass'], 4),
-            "precision_fail": round(metrics['precision_fail'], 4),
-            "recall_fail": round(metrics['recall_fail'], 4),
-            "f1_fail": round(metrics['f1_fail'], 4),
-        },
-        "confusion_matrix": {
-            "tp": metrics['tp'],
-            "fp": metrics['fp'],
-            "fn": metrics['fn'],
-            "tn": metrics['tn'],
-        },
-        "per_category": {
-            cat: {
-                "accuracy": round(calculate_metrics(cat_results)['accuracy'], 4),
-                "kappa": round(calculate_metrics(cat_results)['kappa'], 4),
-                "samples": len(cat_results),
-            }
-            for cat, cat_results in categories.items()
-        } if categories else {},
-    }
-
-    # Ensure output directory exists
-    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-
-    # Append to JSONL file
-    with open(args.output, "a") as f:
-        f.write(json.dumps(run_record) + "\n")
-
-    print(f"\n  Run saved to: {args.output}")
+    # Save run
+    save_run(
+        results,
+        args.model,
+        DATA_FILE,
+        output_file=args.output,
+        category_filter=args.category,
+    )
 
 
 if __name__ == "__main__":

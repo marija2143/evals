@@ -23,39 +23,71 @@ git clone https://github.com/nibzard/evals.git
 cd evals
 
 # Add your API keys to .env
-echo "GOOGLE_API_KEY=your-key" >> .env
 echo "OPENAI_API_KEY=your-key" >> .env
 
-# Run evaluation demos
-uv run eval_demo_gpt5.py      # GPT-5.1 with function calling (recommended)
-uv run eval_demo_gpt4.py      # GPT-4o-mini
-uv run eval_demo_gemini.py    # Gemini (requires quota)
+# Start with the examples (no API key needed for metrics example)
+uv run examples/kappa_calculator.py   # Understand why Kappa > accuracy
+
+# Run your first evaluation
+uv run examples/minimal_eval.py       # Simplest evaluation (1 sample)
 
 # Verify evaluator against ground truth
 uv run verify_evaluator.py --sample 50
 ```
 
+## Learning Path
+
+New to LLM evaluation? Follow this progression:
+
+| Step | Resource | Time | What You'll Learn |
+|------|----------|------|-------------------|
+| 1 | `examples/kappa_calculator.py` | 5 min | Why accuracy is misleading |
+| 2 | `examples/minimal_eval.py` | 10 min | Your first evaluation |
+| 3 | `docs/tutorial/01-06*.md` | 1 hour | Complete methodology |
+| 4 | `notebooks/*.py` (marimo) | 1 hour | Interactive exploration |
+| 5 | `verify_evaluator.py` | - | Production pipeline |
+
+```bash
+# Interactive notebooks (marimo)
+uv run marimo edit notebooks/01_understanding_evals.py
+uv run marimo edit notebooks/02_position_bias.py
+uv run marimo edit notebooks/03_kappa_intuition.py
+```
+
 ## Project Structure
 
 ```
-├── eval_demo_gemini.py       # Gemini 2.0 Flash Lite demo
-├── eval_demo_gpt4.py         # GPT-4o-mini (Chat Completions)
-├── eval_demo_gpt5.py         # GPT-5.1 (Responses API + function calling)
-├── verify_evaluator.py       # Verify evaluator vs ground truth labels
-├── plot_runs.py              # Visualize run comparisons
-├── scripts/
-│   ├── generate_answers.py   # Generate answers with Gemini
-│   ├── generate_hard_questions.py  # Generate challenging questions
-│   └── label_responses.py    # Label with GPT-5.1 function calling
-├── data/
-│   └── questions_version_2.csv  # 200 questions, 35.5% fail rate
+├── examples/                 # START HERE - Simple learning examples
+│   ├── minimal_eval.py       # Simplest evaluation (30 lines)
+│   ├── kappa_calculator.py   # Understand metrics (no API needed)
+│   ├── text_vs_function.py   # Why function calling matters
+│   └── position_bias_demo.py # Detect position bias
+│
+├── notebooks/                # Interactive marimo notebooks
+│   ├── 01_understanding_evals.py
+│   ├── 02_position_bias.py
+│   └── 03_kappa_intuition.py
+│
+├── evaluators/               # Modular evaluation framework
+│   ├── openai_evaluator.py   # OpenAI Responses API
+│   ├── cerebras_evaluator.py # Cerebras (Llama models)
+│   └── metrics.py            # Cohen's Kappa, etc.
+│
 ├── docs/
-│   └── plots/                # Generated visualizations (tracked)
-├── results/
-│   └── runs.jsonl            # Evaluation run logs (gitignored)
-├── EVAL_PROVIDERS.md         # Provider comparison report
-├── LESSONS_LEARNED.md        # API patterns and gotchas
-└── CLAUDE.md                 # Instructions for Claude Code
+│   ├── tutorial/             # 6-part learning progression
+│   ├── glossary.md           # Key terminology
+│   ├── architecture.md       # System diagrams
+│   ├── api_comparison.md     # API differences
+│   ├── common_mistakes.md    # Pitfalls to avoid
+│   └── plots/                # Generated visualizations
+│
+├── eval_demo_*.py            # Provider comparison demos
+├── verify_evaluator.py       # Full verification pipeline
+├── plot_runs.py              # Visualize run comparisons
+│
+├── scripts/                  # Data generation pipeline
+├── data/                     # Datasets (200 samples)
+└── results/                  # Run logs (gitignored)
 ```
 
 ## Provider Comparison
@@ -138,6 +170,17 @@ GPT-5-mini achieves kappa 0.615 against GPT-5.1 labels - substantial agreement a
 ## Commands Reference
 
 ```bash
+# Learning examples (start here!)
+uv run examples/minimal_eval.py       # Simplest evaluation
+uv run examples/kappa_calculator.py   # Understand metrics (no API)
+uv run examples/text_vs_function.py   # Why function calling matters
+uv run examples/position_bias_demo.py # Detect position bias
+
+# Interactive notebooks
+uv run marimo edit notebooks/01_understanding_evals.py
+uv run marimo edit notebooks/02_position_bias.py
+uv run marimo edit notebooks/03_kappa_intuition.py
+
 # Evaluation demos
 uv run eval_demo_gpt5.py              # Recommended
 uv run eval_demo_gpt4.py
@@ -148,17 +191,27 @@ uv run verify_evaluator.py                              # Full dataset
 uv run verify_evaluator.py --sample 50                  # Sample 50 items
 uv run verify_evaluator.py --model gpt-5-nano-2025-08-07  # Test different model
 uv run verify_evaluator.py --category precise_calculations  # Filter by category
-uv run verify_evaluator.py --output results/custom.jsonl    # Custom output file
 
 # Visualize evaluation runs
-uv run plot_runs.py                   # Save to docs/plots/ (default)
+uv run plot_runs.py                   # Save to docs/plots/
 uv run plot_runs.py --last 5          # Only last 5 runs
-uv run plot_runs.py --output custom/  # Custom output directory
 
 # Data generation pipeline
 uv run scripts/generate_hard_questions.py  # Generate questions + answers
 uv run scripts/label_responses.py          # Label with GPT-5.1
 ```
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [`docs/tutorial/`](docs/tutorial/) | 6-part learning progression |
+| [`docs/glossary.md`](docs/glossary.md) | Key terminology (Kappa, position bias, etc.) |
+| [`docs/architecture.md`](docs/architecture.md) | System diagrams and data flow |
+| [`docs/common_mistakes.md`](docs/common_mistakes.md) | 10 pitfalls to avoid |
+| [`docs/api_comparison.md`](docs/api_comparison.md) | API differences between providers |
+| [`EVAL_PROVIDERS.md`](EVAL_PROVIDERS.md) | Detailed provider comparison |
+| [`LESSONS_LEARNED.md`](LESSONS_LEARNED.md) | API patterns and gotchas |
 
 ## References
 
